@@ -3,14 +3,8 @@
 
 #include <Python.h>
 #include "geos.h"
+#include "pygeom.h"
 
-
-typedef struct {
-    PyObject_HEAD
-    void *ptr;
-    PyObject *geometries;
-    long count;
-} STRtreeObject;
 
 /* A resizable vector with numpy indices */
 typedef struct
@@ -19,8 +13,24 @@ typedef struct
     npy_intp *a;
 } npy_intp_vec;
 
-PyTypeObject STRtreeType;
 
-int init_strtree_type(PyObject *m);
+/* A resizable vector with pointers */
+typedef struct
+{
+    size_t n, m;
+    GeometryObject **a;
+} geom_obj_vec;
+
+typedef struct {
+    PyObject_HEAD
+    void *ptr;
+    npy_intp count;
+    geom_obj_vec _geoms;
+} STRtreeObject;
+
+
+extern PyTypeObject STRtreeType;
+
+extern int init_strtree_type(PyObject *m);
 
 #endif

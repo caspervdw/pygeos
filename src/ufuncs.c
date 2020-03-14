@@ -391,6 +391,7 @@ static void *intersection_data[1] = {GEOSIntersection_r};
 static void *difference_data[1] = {GEOSDifference_r};
 static void *symmetric_difference_data[1] = {GEOSSymDifference_r};
 static void *union_data[1] = {GEOSUnion_r};
+static void *shared_paths_data[1] = {GEOSSharedPaths_r};
 typedef void *FuncGEOS_YY_Y(void *context, void *a, void *b);
 static char YY_Y_dtypes[3] = {NPY_OBJECT, NPY_OBJECT, NPY_OBJECT};
 static void YY_Y_func(char **args, npy_intp *dimensions,
@@ -934,14 +935,40 @@ static void create_collection_func(char **args, npy_intp *dimensions,
         goto finish;
     }
     int type;
+    char actual_type, expected_type;
 
     BINARY_SINGLE_COREDIM_LOOP_OUTER {
         type = *(int *) ip2;
+        switch (type) {
+            case GEOS_MULTIPOINT:
+                expected_type = GEOS_POINT;
+                break;
+            case GEOS_MULTILINESTRING:
+                expected_type = GEOS_LINESTRING;
+                break;
+            case GEOS_MULTIPOLYGON:
+                expected_type = GEOS_POLYGON;
+                break;
+            case GEOS_GEOMETRYCOLLECTION:
+                expected_type = -1;
+                break;
+        default:
+            PyErr_Format(PyExc_TypeError, "Only %d, %d, %d, and %d are valid geometry collection types (got: %d).", GEOS_MULTIPOINT, GEOS_MULTILINESTRING, GEOS_MULTIPOLYGON, GEOS_GEOMETRYCOLLECTION, type);
+            goto finish;
+        }
         n_geoms = 0;
         cp1 = ip1;
         BINARY_SINGLE_COREDIM_LOOP_INNER {
             if (!get_geom(*(GeometryObject **)cp1, &g)) { goto finish; }
             if (g == NULL) { continue; }
+            if (expected_type != -1) {
+                actual_type = GEOSGeomTypeId_r(context_handle, g);
+                if (actual_type == -1) { goto finish; }
+                if (actual_type != expected_type) {
+                    PyErr_Format(PyExc_TypeError, "One of the input geometries is of incorrect type (expected: %d, got: %d).", actual_type, expected_type);
+                    goto finish;
+                };
+            }
             g_copy = GEOSGeom_clone_r(context_handle, g);
             if (g_copy == NULL) { goto finish; }
             geoms[n_geoms] = g_copy;
@@ -955,6 +982,71 @@ static void create_collection_func(char **args, npy_intp *dimensions,
         if (geoms != NULL) { free(geoms); }
 }
 static PyUFuncGenericFunction create_collection_funcs[1] = {&create_collection_func};
+
+
+static char bounds_dtypes[2] = {NPY_OBJECT, NPY_DOUBLE};
+static void bounds_func(char **args, npy_intp *dimensions,
+                        npy_intp *steps, void *data)
+{
+    void *context = geos_context[0];
+    GEOSGeometry *envelope, *in1;
+    const GEOSGeometry *ring;
+    const GEOSCoordSequence *coord_seq;
+    int size;
+    char *ip1 = args[0], *op1 = args[1];
+    double *x1, *y1, *x2, *y2;
+
+    npy_intp is1 = steps[0], os1 = steps[1], cs1 = steps[2];
+    npy_intp n = dimensions[0], i;
+
+    for(i = 0; i < n; i++, ip1 += is1, op1 += os1) {
+        if (!get_geom(*(GeometryObject **)ip1, &in1)) { return; }
+
+        /* get the 4 (pointers to) the bbox values from the "core stride 1" (cs1) */
+        x1 = (double *)(op1);
+        y1 = (double *)(op1 + cs1);
+        x2 = (double *)(op1 + 2 * cs1);
+        y2 = (double *)(op1 + 3 * cs1);
+
+        if (in1 == NULL) {  /* no geometry => bbox becomes (nan, nan, nan, nan) */
+            *x1 = *y1 = *x2 = *y2 = NPY_NAN;
+        } else {
+            /* construct the envelope */
+            envelope = GEOSEnvelope_r(context, in1);
+            if (envelope == NULL) { return; }
+            size = GEOSGetNumCoordinates_r(context, envelope);
+
+            /* get the bbox depending on the number of coordinates in the envelope */
+            if (size == 0) {  /* Envelope is empty */
+                *x1 = *y1 = *x2 = *y2 = NPY_NAN;
+            } else if (size == 1) {  /* Envelope is a point */
+                if (!GEOSGeomGetX_r(context, envelope, x1)) { goto fail; }
+                if (!GEOSGeomGetY_r(context, envelope, y1)) { goto fail; }
+                *x2 = *x1;
+                *y2 = *y1;
+            } else if (size == 5) {  /* Envelope is a box */
+                ring = GEOSGetExteriorRing_r(context, envelope);
+                if (ring == NULL) { goto fail; }
+                coord_seq = GEOSGeom_getCoordSeq_r(context, ring);
+                if (coord_seq == NULL) { goto fail; }
+                if (!GEOSCoordSeq_getX_r(context, coord_seq, 0, x1)) { goto fail; }
+                if (!GEOSCoordSeq_getY_r(context, coord_seq, 0, y1)) { goto fail; }
+                if (!GEOSCoordSeq_getX_r(context, coord_seq, 2, x2)) { goto fail; }
+                if (!GEOSCoordSeq_getY_r(context, coord_seq, 2, y2)) { goto fail; }
+            } else {
+                PyErr_Format(PyExc_ValueError, "Could not determine bounds from an envelope with %d coordinate pairs", size);
+                goto fail;
+            }
+            GEOSGeom_destroy_r(context, envelope);
+        }
+    }
+
+    return;
+    fail:
+        GEOSGeom_destroy_r(context, envelope);
+        return;
+}
+static PyUFuncGenericFunction bounds_funcs[1] = {&bounds_func};
 
 
 
@@ -1043,7 +1135,7 @@ static void from_wkt_func(char **args, npy_intp *dimensions,
     GEOSWKTReader *reader;
     const char *wkt;
 
-    /* Create the WKB reader */
+    /* Create the WKT reader */
     reader = GEOSWKTReader_create_r(context_handle);
     if (reader == NULL) {
         return;
@@ -1085,6 +1177,47 @@ static void from_wkt_func(char **args, npy_intp *dimensions,
 }
 static PyUFuncGenericFunction from_wkt_funcs[1] = {&from_wkt_func};
 
+static char from_shapely_dtypes[2] = {NPY_OBJECT, NPY_OBJECT};
+static void from_shapely_func(char **args, npy_intp *dimensions,
+                              npy_intp *steps, void *data)
+{
+    void *context_handle = geos_context[0];
+    GEOSGeometry *in_ptr, *ret_ptr;
+    PyObject *in1, *attr;
+
+    UNARY_LOOP {
+        /* ip1 is pointer to array element PyObject* */
+        in1 = *(PyObject **)ip1;
+
+        if (in1 == Py_None) {
+            /* None in the input propagates to the output */
+            ret_ptr = NULL;
+        }
+        else {
+            /* Get the __geom__ attribute */
+            attr = PyObject_GetAttrString(in1, "__geom__");
+            if (attr == NULL) {
+                /* Raise if __geom__ does not exist */
+                PyErr_Format(PyExc_TypeError, "Expected a shapely object or None, got %s", Py_TYPE(in1)->tp_name);
+                return;
+            } else if (!PyLong_Check(attr)) {
+                /* Raise if __geom__ is of incorrect type */
+                PyErr_Format(PyExc_TypeError, "Expected int for the __geom__ attribute, got %s", Py_TYPE(attr)->tp_name);
+                Py_XDECREF(attr);
+                return;
+            }
+            /* Convert it to a GEOSGeometry pointer */
+            in_ptr = PyLong_AsVoidPtr(attr);
+            Py_XDECREF(attr);
+            /* Clone the geometry and finish */
+            ret_ptr = GEOSGeom_clone_r(context_handle, in_ptr);
+            if (ret_ptr == NULL) { return; }
+        }
+        OUTPUT_Y;
+    }
+}
+static PyUFuncGenericFunction from_shapely_funcs[1] = {&from_shapely_func};
+
 static char to_wkb_dtypes[6] = {NPY_OBJECT, NPY_BOOL, NPY_INT, NPY_INT, NPY_BOOL, NPY_OBJECT};
 static void to_wkb_func(char **args, npy_intp *dimensions,
                         npy_intp *steps, void *data)
@@ -1123,7 +1256,7 @@ static void to_wkb_func(char **args, npy_intp *dimensions,
         if (!get_geom(*(GeometryObject **)ip1, &in1)) { goto finish; }
         PyObject **out = (PyObject **)op1;
 
-        if (in1 == NULL) {  
+        if (in1 == NULL) {
             Py_XDECREF(*out);
             Py_INCREF(Py_None);
             *out = Py_None;
@@ -1184,7 +1317,7 @@ static void to_wkt_func(char **args, npy_intp *dimensions,
         if (!get_geom(*(GeometryObject **)ip1, &in1)) { goto finish; }
         PyObject **out = (PyObject **)op1;
 
-        if (in1 == NULL) {  
+        if (in1 == NULL) {
             Py_XDECREF(*out);
             Py_INCREF(Py_None);
             *out = Py_None;
@@ -1316,6 +1449,7 @@ int init_ufuncs(PyObject *m, PyObject *d)
     DEFINE_YY_Y (difference);
     DEFINE_YY_Y (symmetric_difference);
     DEFINE_YY_Y (union);
+    DEFINE_YY_Y (shared_paths);
 
     DEFINE_Y_d (get_x);
     DEFINE_Y_d (get_y);
@@ -1346,6 +1480,7 @@ int init_ufuncs(PyObject *m, PyObject *d)
     DEFINE_GENERALIZED(points, 1, "(d)->()");
     DEFINE_GENERALIZED(linestrings, 1, "(i, d)->()");
     DEFINE_GENERALIZED(linearrings, 1, "(i, d)->()");
+    DEFINE_GENERALIZED(bounds, 1, "()->(n)");
     DEFINE_Y_Y (polygons_without_holes);
     DEFINE_GENERALIZED(polygons_with_holes, 2, "(),(i)->()");
     DEFINE_GENERALIZED(create_collection, 2, "(i),()->()");
@@ -1354,6 +1489,7 @@ int init_ufuncs(PyObject *m, PyObject *d)
     DEFINE_CUSTOM (from_wkt, 1);
     DEFINE_CUSTOM (to_wkb, 5);
     DEFINE_CUSTOM (to_wkt, 5);
+    DEFINE_CUSTOM (from_shapely, 1);
 
     Py_DECREF(ufunc);
     return 0;
